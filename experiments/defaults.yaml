@@ -1,0 +1,531 @@
+# --------------------------------
+images:
+  - name: llm-d-benchmark
+    registry: ghcr.io
+    repo: llm-d
+    image: llm-d-benchmark
+    tag: .auto # list all tags, pick the latest
+  - name: llm-d
+    registry: ghcr.io
+    repo: llm-d
+    image: llm-d-cuda
+    tag: .auto # list all tags, pick the latest
+  - name: llm-d-model-service
+    registry: ghcr.io
+    repo: llm-d
+    image: llm-d-model-service
+    tag: .auto # list all tags, pick the latest
+  - name: llm-d-inference-scheduler
+    registry: ghcr.io
+    repo: llm-d
+    image: llm-d-inference-scheduler
+    tag: .auto # list all tags, pick the latest
+  - name: llm-d-routing-sidecar
+    registry: ghcr.io
+    repo: llm-d
+    image: llm-d-routing-sidecar
+    tag: .auto # list all tags, pick the latest
+  - name: llm-d-inference-sim
+    registry: ghcr.io
+    repo: llm-d
+    image: llm-d-inference-sim
+    tag: .auto # list all tags, pick the latest
+  - name: vllm
+    registry: docker.io
+    repo: vllm
+    image: vllm-openai
+    tag: latest
+# --------------------------------
+charts:
+  - chart: kgateway-crds
+    url: oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds
+    version: 2.0.3
+  - chart: kgateway
+    url: oci://cr.kgateway.dev/kgateway-dev/charts/kgateway
+    version: 2.0.3
+  - chart: istio
+    url: oci://gcr.io/istio-testing/charts
+    version: 1.28-alpha.89f30b26ba71bf5e538083a4720d0bc2d8c06401
+  - chart: llm-d-infra
+    url: https://llm-d-incubation.github.io/llm-d-infra
+    version: 1.3.0
+  - chart: gateway-api-inference-extension
+    url: oci://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool
+    version: .auto # list all versions, pick the latest
+    #oci helm repos do not output a list of versions. Use "skopeo list-tags docker://registry.k8s.io/gateway-api-inference-extension/charts/inferencepool"
+  - chart: llm-d-modelservice
+    url: https://llm-d-incubation.github.io/llm-d-modelservice/
+    version: .auto # list all versions, pick the latest
+# --------------------------------
+prepare:
+  dependencies:
+    gateway :
+      provider :
+        - type: kgateway
+          helm:
+            - chart: .charts.kgateway-crds
+            - chart: .charts.kgateway
+          deploy: true
+          check: true
+        - type: istio
+          helm:
+            - chart: .charts.istio
+          deploy: false
+          check: false
+      api:
+        url: https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd
+        version: 1.3.0
+        deploy: true
+        check: true
+        inference_extension:
+          url: https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd
+          version: 1.0.1
+          deploy: true
+          check: true
+      wva:
+        namespace: workload-variant-autoscaler-system
+        helm: oci://ghcr.io/llm-d/workload-variant-autoscaler
+        image: ghcr.io/llm-d/workload-variant-autoscaler:auto
+        replicas: 1
+        version: 0.1.0
+        autoscaling:
+          enabled: true
+          slo:
+            tpot: 30
+            ttft: 1000
+        hpa:
+          enabled: true
+          max_replicas: 10
+          target_avg_value: 1
+        vllm:
+          enabled: true
+          node_port_min: 30000
+          node_port_max: 32767
+          interval: 15
+        workload_monitoring:
+          namespace: openshift-user-workload-monitoring
+          url: https://thanos-querier.openshift-monitoring.svc.cluster.local
+          port: 9091
+      deploy: true
+      check: true
+    storage:
+      - name: model-storage
+        namespace: .standup[i].parameters.namespace
+        class: default
+        size: 300Gi
+        download:
+          url: <model list>
+          enabled: true
+          timeout: 3600
+        deploy: true
+        check: true
+      - name: replay-pvc
+        namespace: .harness[i].parameters.namespace
+        class: default
+        size: 300Gi
+        download:
+          url: https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/blob/main/ShareGPT_V3_unfiltered_cleaned_split.json
+          enabled: false
+          timeout: 3600
+        deploy: true
+        check: true
+      - name: workload-pvc
+        namespace: .harness[i].parameters.namespace
+        class: default
+        size: 300Gi
+        deploy: true
+        check: true
+    secrets:
+      - name: llm-d-hf-token
+        secret: HF_TOKEN
+        contents: <base64>
+    files:
+      - name: llm-d-benchmark-preprocesses
+        path: BASE_DIR/setup/preprocess # BASE_DIR gets expanded into
+    monitoring:
+#      TBD
+# --------------------------------
+standup:
+  - stack: meta-llama/Llama-3.1-8B-Instruct
+    parameters:
+      namespace: stackbenchns
+      release: stackbenchr
+      volumes:
+        - name: model-storage
+          type: pvc
+          mount: model-storage
+      accelerators:
+        common:
+          acceleratorTypes:
+            labelKey: nvidia.com/gpu.product
+            labelValues:
+              - NVIDIA-H100-80GB-HBM3
+        decode: .standup[i].parameters.accelerators.common
+        prefill: .standup[i].parameters.accelerators.common
+      replicas:
+        common: 1
+        decode: .standup[i].parameters.replicas.common
+        prefill: .standup[i].parameters.replicas.common
+      parallelism:
+        common:
+          data: 1
+          tensor: 1
+        decode:
+          data: .standup[i].parameters.parallelism.common.data
+          tensor: .standup[i].parameters.parallelism.common.tensor
+        prefill:
+          data: .standup[i].parameters.parallelism.common.data
+          tensor: .standup[i].parameters.parallelism.common.tensor
+      resources:
+        common:
+          memory: 40Gi
+          cpu: "4"
+          nvidia.com/gpu: "1"
+        decode:
+          memory: .standup[i].parameters.resources.common.memory
+          cpu: .standup[i].parameters.resources.common.cpu
+          nvidia.com/gpu: .standup[i].parameters.resources.common.\"nvidia.com/gpu\"
+        prefill:
+          memory: .standup[i].parameters.resources.common.memory
+          cpu: .standup[i].parameters.resources.common.cpu
+          nvidia.com/gpu: .standup[i].parameters.resources.common.\"nvidia.com/gpu\"
+      command:
+        common:
+          type: vllmServe
+          args:
+            - "--disable-log-requests"
+            - "--max-model-len"
+            - "16384"
+            - "--tensor-parallel-size"
+            - "1"
+        decode:
+          type: .standup[i].parameters.command.common.type
+          args: .standup[i].parameters.command.common.args
+        prefill:
+          type: .standup[i].parameters.command.common.type
+          args: .standup[i].parameters.command.common.args
+      env:
+        common:
+          - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: UCX_TLS
+            value: "rc,sm,cuda_ipc,cuda_copy,tcp"
+          - name: UCX_SOCKADDR_TLS_PRIORITY
+            value: "tcp"
+          ###- name: UCX_NET_DEVICES
+          ###  value: mlx5_1:1
+          ###- name: NCCL_IB_HCA
+          ###  value: mlx5_1
+          - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+            value: ".standup[i].parameters.ports.nixl"
+          - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+            value: "1"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
+        decode: .standup[i].parameters.env.common
+        prefill: .standup[i].parameters.env.common
+      ports:
+        service: 8000
+        extra: 9002
+        readiness: 8200
+        zmq: 5557
+        nixl: 5557
+# ----------------------------------------------------------------
+    infra:
+      - helm: .charts.llm-d-infra
+        contents:
+          gateway:
+            gatewayClassName: .auto # logic to decide the provider name based on deploy=true on .prepare.dependencies.gateway.provider
+            service:
+              type: NodePort
+            gatewayParameters:
+              enabled: true
+        deploy: true
+        check: true
+# ----------------------------------------------------------------
+    gaie:
+      - helm: .charts.gateway-api-inference-extension
+        contents:
+          inferenceExtension:
+            replicas: 1
+            image:
+              name: .images[]|select(.name=="llm-d-inference-scheduler").name
+              hub: .images[]|select(.name=="llm-d-inference-scheduler").registry/.images[]|select(.name=="llm-d-inference-scheduler").repo
+              tag: .auto # automatically detects latest tag
+              pullPolicy: Always
+            extProcPort: .standup[i].parameters.ports.extra
+            extraContainerPorts:
+              - name: zmq
+                containerPort: .standup[i].parameters.ports.zmq
+                protocol: TCP
+            extraServicePorts:
+              - name: zmq
+                port: .standup[i].parameters.ports.zmq
+                targetPort: .standup[i].parameters.ports.zmq
+                protocol: TCP
+            env:
+              - name: .prepare.dependencies.secrets[0].secret
+                valueFrom:
+                  secretKeyRef:
+                    name: .prepare.dependencies.secrets[0].name
+                    key: .prepare.dependencies.secrets[0].secret
+            pluginsConfigFile: "default-plugins.yaml"
+          inferencePool:
+            targetPortNumber: .standup[i].parameters.ports.service
+            modelServerType: vllm
+            apiVersion: "inference.networking.x-k8s.io/v1alpha2"
+            modelServers:
+              matchLabels:
+                llm-d.ai/inferenceServing: "true"
+                llm-d.ai/model: .label(.standup[i].stack)
+          provider:
+            name: .auto # logic to decide the provider name based on deploy=true on .prepare.dependencies.gateway.provider
+        deploy: true
+        check: true
+# ----------------------------------------------------------------
+    modelservice:
+      - helm: .charts.llm-d-modelservice
+        contents:
+          fullnameOverride: .label(.standup.stack[i])
+          multinode: False
+          modelArtifacts:
+            uri: .standup[i].stack.parameter.volumes[0].type://.standup[i].stack.parameter.volumes[0].mount/models/.standup[i].stack
+            size: .prepare.dependencies.storage[]|select(name=.standup[i].stack.parameter.volumes[0].name).size
+            authSecretName: ".prepare.dependencies.secrets[0].name"
+            name: .standup[i].stack
+          routing:
+            servicePort: .standup[i].parameters.ports.service
+            parentRefs:
+              - group: gateway.networking.k8s.io
+                kind: Gateway
+                name: infra-.standup[0].release-inference-gateway
+            proxy:
+              image: ".images[]|select(.name==\"llm-d-routing-sidecar\").registry/.images[]|select(.name==\"llm-d-routing-sidecar\").repo/.images[]|select(.name==\"llm-d-routing-sidecar\").image:.images[]|select(.name==\"llm-d-routing-sidecar\").tag"
+              secure: false
+              connector: nixlv2
+              debugLevel: 3
+            inferencePool:
+              create: False
+              name: .label(.standup[i].stack)
+            httpRoute:
+              create: True
+              rules:
+              - backendRefs:
+                - group: inference.networking.x-k8s.io
+                  kind: InferencePool
+                  name: .label(.standup[i].stack)
+                  port: .standup[i].parameters.ports.service
+                  weight: 1
+                timeouts:
+                  backendRequest: 0s
+                  request: 0s
+                matches:
+                - path:
+                    type: PathPrefix
+                    value: /.standup[i].stack/
+                filters:
+                - type: URLRewrite
+                  urlRewrite:
+                    path:
+                      type: ReplacePrefixMatch
+                      replacePrefixMatch: /
+              - backendRefs:
+                - group: inference.networking.x-k8s.io
+                  kind: InferencePool
+                  name: .label(.standup[i].stack)
+                  port: .standup[i].parameters.ports.service
+                  weight: 1
+                timeouts:
+                  backendRequest: 0s
+                  request: 0s
+            epp:
+              create: False
+          decode:
+            create: bool(.standup[i].parameters.replicas.decode)
+            replicas: .standup[i].parameters.replicas.decode
+            acceleratorTypes: .standup[i].parameters.accelerators.decode
+            parallelism:
+              data: .standup[i].parameters.parallelism.decode.data
+              tensor: .standup[i].parameters.parallelism.decode.tensor
+            annotations:
+                deployed-by: ".auto" # just user current user name
+                modelservice: "llm-d-benchmark"
+            podAnnotations:
+                deployed-by: ".auto" # just use current user name
+                modelservice: "llm-d-benchmark"
+            extraConfig:
+            containers:
+            - name: "vllm"
+              mountModelVolume: true
+              image: ".images[]|select(.name==\"llm-d\").registry/.images[]|select(.name==\"llm-d\").repo/.images[]|select(.name==\"llm-d\").image:.images[]|select(.name==\"llm-d\").tag"
+              modelCommand: .standup[i].parameters.command.decode.type
+              args: .standup[i].parameters.command.decode.args
+              env: .standup[i].parameters.env.decode
+              resources:
+                limits:
+                  memory: .standup[i].parameters.resources.decode.memory
+                  cpu: ".standup[i].parameters.resources.decode.cpu"
+                  nvidia.com/gpu: ".standup[0].parameters.resources.decode.\"nvidia.com/gpu\""
+                requests:
+                  memory: .standup[i].parameters.resources.decode.memory
+                  cpu: ".standup[i].parameters.resources.decode.cpu"
+                  nvidia.com/gpu: ".standup[i].parameters.resources.decode.\"nvidia.com/gpu\""
+              extraConfig:
+                startupProbe:
+                  httpGet:
+                    path: /health
+                    port: .standup[i].parameters.ports.service
+                  failureThreshold: 60
+                  initialDelaySeconds: 30
+                  periodSeconds: 30
+                  timeoutSeconds: 5
+                livenessProbe:
+                  tcpSocket:
+                    port: .standup[i].parameters.ports.service
+                  failureThreshold: 3
+                  periodSeconds: 5
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: .standup[i].parameters.ports.readiness
+                  failureThreshold: 3
+                  periodSeconds: 5
+              volumeMounts:
+            volumes:
+          prefill:
+            create: bool(.standup[i].parameters.replicas.prefill)
+            replicas: .standup[i].parameters.replicas.prefill]
+            acceleratorTypes: .standup[i].parameters.accelerators.decode
+            parallelism:
+              data: .standup[i].parameters.parallelism.prefill.data
+              tensor: .standup[i].parameters.parallelism.prefill.tensor
+            annotations:
+                deployed-by: ".auto" # just user current user name
+                modelservice: "llm-d-benchmark"
+            podAnnotations:
+                deployed-by: ".auto" # just use current user name
+                modelservice: "llm-d-benchmark"
+            extraConfig:
+            containers:
+            - name: "vllm"
+              mountModelVolume: true
+              image: ".images[]|select(.name==\"llm-d\").registry/.images[]|select(.name==\"llm-d\").repo/.images[]|select(.name==\"llm-d\").image:.images[]|select(.name==\"llm-d\").tag"
+              modelCommand: .standup[i].parameters.command.prefill.type
+              args: .standup[i].parameters.command.prefill.args
+              env: .standup[i].parameters.env.prefill
+              resources:
+                limits:
+                  memory: .standup[i].parameters.resources.prefill.memory
+                  cpu: ".standup[i].parameters.resources.prefill.cpu"
+                  nvidia.com/gpu: ".standup[i].parameters.resources.prefill.\"nvidia.com/gpu\""
+                requests:
+                  memory: .standup[i].parameters.resources.prefill.memory
+                  cpu: ".standup[i].parameters.resources.prefill.cpu"
+                  nvidia.com/gpu: ".standup[i].parameters.resources.prefill.\"nvidia.com/gpu\""
+              extraConfig:
+                startupProbe:
+                  httpGet:
+                    path: /health
+                    port: .standup[i].parameters.ports.service
+                  failureThreshold: 60
+                  initialDelaySeconds: 30
+                  periodSeconds: 30
+                  timeoutSeconds: 5
+                livenessProbe:
+                  tcpSocket:
+                    port: .standup[i].parameters.ports.service
+                  failureThreshold: 3
+                  periodSeconds: 5
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: .standup[i].parameters.ports.service
+                  failureThreshold: 3
+                  periodSeconds: 5
+              volumeMounts:
+            volumes:
+        deploy: true
+        check: true
+# ----------------------------------------------------------------
+harness:
+    - name: inference-perf
+      parameters:
+        namespace: harnessns
+        profile: sanity_random.yaml
+        executable: llm-d-benchmark.sh
+        timeout: 3600
+        resources:
+          memory: 32Gi
+          cpu: "16"
+        volumes:
+          - name: workload-pvc
+            type: pvc
+            mount: /requests
+          - name: replay-pvc
+            type: pvc
+            mount: /data
+        env:
+          - name: LLMDBENCH_RUN_EXPERIMENT_LAUNCHER
+            value: "1"
+          - name: LLMDBENCH_RUN_DATASET_URL
+            value: ".prepare.dependencies.storage[]|select(name=replay-pvc).download.url"
+          - name: LLMDBENCH_RUN_WORKSPACE_DIR
+            value: "/workspace"
+          - name: LLMDBENCH_HARNESS_NAME
+            value: ".harness[i].parameters.name"
+#          - name: LLMDBENCH_CONTROL_WORK_DIR
+#            value: "${LLMDBENCH_RUN_EXPERIMENT_RESULTS_DIR}"
+          - name: LLMDBENCH_HARNESS_NAMESPACE
+            value: ".harness[i].parameters.namespace"
+          - name: LLMDBENCH_HARNESS_STACK_TYPE
+            value: "auto" # a function will determine if "modelservice" or "standlone" was set
+          - name: LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
+            value: "${LLMDBENCH_HARNESS_STACK_ENDPOINT_URL}"
+          - name: LLMDBENCH_HARNESS_STACK_NAME
+            value: "${LLMDBENCH_HARNESS_SANITIZED_STACK_NAME}"
+          - name: LLMDBENCH_DEPLOY_METHODS
+            value: "${LLMDBENCH_DEPLOY_METHODS}"
+          - name: LLMDBENCH_MAGIC_ENVAR
+            value: "harness_pod"
+          - name: HF_TOKEN_SECRET
+            value: "${LLMDBENCH_VLLM_COMMON_HF_TOKEN_NAME}"
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: ${LLMDBENCH_VLLM_COMMON_HF_TOKEN_NAME}
+                key: HF_TOKEN
+      contents:
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: .harness[i].parameters.name-launcher
+          namespace: .harness[i].parameters.namespace
+        labels:
+          app: .harness[i].parameters.name-launcher
+      spec:
+        containers:
+        - name: harness
+          image: ".images[]|select(.name==\"llm-d\").registry/.images[]|select(.name==\"llm-d\").repo/.images[]|select(.name==\"llm-d\").image:.images[]|select(.name==\"llm-d\").tag"
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 0
+          command: ["sh", "-c"]
+          args:
+          - ".harness[i].parameters.executable"
+          resources:
+            limits:
+              cpu: ".harness[i].parameters.resources.cpu"
+              memory: .harness[i].parameters.resources.memory
+            requests:
+              cpu: ".harness[i].parameters.resources.cpu"
+              memory: .harness[i].parameters.resources.memory
+          env: .harness[i].parameters.env
+          volumeMounts:
+          - name: results
+            mountPath: .harness[i].parameters.volumes[0].mount
+        volumes:
+          - name: results
+            persistentVolumeClaim:
+              claimName: .harness[i].parameters.volumes[0].name
