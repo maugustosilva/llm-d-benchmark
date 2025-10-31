@@ -1,27 +1,46 @@
-setup:
-  factors:
-    - LLMDBENCH_VLLM_MODELSERVICE_GAIE_PLUGINS_CONFIGFILE
-  levels:
-    LLMDBENCH_VLLM_MODELSERVICE_GAIE_PLUGINS_CONFIGFILE: "inf-sche-none.yaml, inf-sche-prefix.yaml, inf-sche-kv.yaml, inf-sche-queue.yaml"
-  treatments:
-    - "inf-sche-none.yaml"
-    - "inf-sche-prefix.yaml"
-    - "inf-sche-kv.yaml"
-    - "inf-sche-queue.yaml"
-run:
-  factors:
-    - question_len
-    - output_len
-  levels:
-    question_len: "100,300,1000"
-    output_len: "100,300,1000"
-  treatments:
-    - "100,100"
-    - "100,300"
-    - "100,1000"
-    - "300,100"
-    - "300,300"
-    - "300,1000"
-    - "1000,100"
-    - "1000,300"
-    - "1000,1000"
+standup:
+  - treatments:
+      - factor: parameters.gaie.plugins
+        levels:
+          - inf-sche-none.yaml
+          - inf-sche-prefix.yaml
+          - inf-sche-kv.yaml
+          - inf-sche-queue.yaml
+  - stack: "stack-1"
+    parameters:
+      model:
+        - name: meta-llama/Llama-3.1-8B-Instruct
+          maxlen: 16384
+      volumes:
+        - name: model-storage
+          size: 1Ti
+      replicas:
+        prefill: 0
+      command:
+        decode:
+          type: vllmServe
+          args:
+            - "--enforce-eager"
+            - "--block-size"
+            - ".standup[0].parameters.model[0].blocksize"
+            - "--kv-transfer-config"
+            - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+            - "--disable-log-requests"
+            - "--disable-uvicorn-access-log"
+            - "--max-model-len"
+            - ".standup[0].parameters.model[0].maxlen"
+harness:
+  - treatments:
+      - factor: data.shared_prefix.question_len
+        levels:
+          - 100
+          - 300
+          - 1000
+      - factor: data.shared_prefix.output_len
+        levels:
+          - 100
+          - 300
+          - 1000
+  - runner: "runner-1"
+    parameters:
+      profile: shared_prefix_synthetic.yaml

@@ -35,7 +35,7 @@ images:
     repo: vllm
     image: vllm-openai
     tag: latest
-# --------------------------------
+# --------------------------------------------------------------------------------------------------------------------------------
 charts:
   - chart: kgateway-crds
     url: oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds
@@ -56,7 +56,7 @@ charts:
   - chart: llm-d-modelservice
     url: https://llm-d-incubation.github.io/llm-d-modelservice/
     version: .auto # list all versions, pick the latest
-# --------------------------------
+# --------------------------------------------------------------------------------------------------------------------------------
 prepare:
   dependencies:
     gateway :
@@ -110,7 +110,7 @@ prepare:
       check: true
     storage:
       - name: model-storage
-        namespace: .standup[i].parameters.namespace
+        namespace: .standup[0].parameters.namespace
         class: default
         size: 300Gi
         download:
@@ -120,7 +120,7 @@ prepare:
         deploy: true
         check: true
       - name: replay-pvc
-        namespace: .harness[i].parameters.namespace
+        namespace: .harness[0].parameters.namespace
         class: default
         size: 300Gi
         download:
@@ -130,7 +130,7 @@ prepare:
         deploy: true
         check: true
       - name: workload-pvc
-        namespace: .harness[i].parameters.namespace
+        namespace: .harness[0].parameters.namespace
         class: default
         size: 300Gi
         deploy: true
@@ -144,67 +144,129 @@ prepare:
         path: BASE_DIR/setup/preprocess # BASE_DIR gets expanded into
     monitoring:
 #      TBD
-# --------------------------------
+# --------------------------------------------------------------------------------------------------------------------------------
 standup:
-  - stack: meta-llama/Llama-3.1-8B-Instruct
+  - stack: "stack-1"
     parameters:
+      model:
+        - name: facebook/opt-125m
+          label: label(.standup[0].parameters.model[0].name) # function which creates the label
+          maxlen: 16384
+          blocksize: 64
       namespace: stackbenchns
       release: stackbenchr
+      gaie:
+        plugins: "default-plugins.yaml"
       volumes:
         - name: model-storage
           type: pvc
           mount: model-storage
+          size: .prepare.dependencies.storage[]|select(name=.standup[0].stack.parameters.volumes[0].name).size
       accelerators:
         common:
-          acceleratorTypes:
-            labelKey: nvidia.com/gpu.product
-            labelValues:
-              - NVIDIA-H100-80GB-HBM3
-        decode: .standup[i].parameters.accelerators.common
-        prefill: .standup[i].parameters.accelerators.common
+          key: nvidia.com/gpu.product
+          value: NVIDIA-H100-80GB-HBM3
+        decode:
+          key: .standup[0].parameters.accelerators.common.key
+          value: .standup[0].parameters.accelerators.common.value
+        prefill:
+          key: .standup[0].parameters.accelerators.common.key
+          value: .standup[0].parameters.accelerators.common.value
       replicas:
         common: 1
-        decode: .standup[i].parameters.replicas.common
-        prefill: .standup[i].parameters.replicas.common
+        decode: .standup[0].parameters.replicas.common
+        prefill: .standup[0].parameters.replicas.common
       parallelism:
         common:
           data: 1
           tensor: 1
         decode:
-          data: .standup[i].parameters.parallelism.common.data
-          tensor: .standup[i].parameters.parallelism.common.tensor
+          data: .standup[0].parameters.parallelism.common.data
+          tensor: .standup[0].parameters.parallelism.common.tensor
         prefill:
-          data: .standup[i].parameters.parallelism.common.data
-          tensor: .standup[i].parameters.parallelism.common.tensor
+          data: .standup[0].parameters.parallelism.common.data
+          tensor: .standup[0].parameters.parallelism.common.tensor
       resources:
         common:
           memory: 40Gi
           cpu: "4"
           nvidia.com/gpu: "1"
+          ephemeral-storage: 20Gi
+        standalone:
+          memory: .standup[0].parameters.resources.common.memory
+          cpu: .standup[0].parameters.resources.common.cpu
+          nvidia.com/gpu: .standup[0].parameters.resources.common.\"nvidia.com/gpu\"
+          ephemeral-storage: .standup[0].parameters.resources.common.ephemeral-storage
         decode:
-          memory: .standup[i].parameters.resources.common.memory
-          cpu: .standup[i].parameters.resources.common.cpu
-          nvidia.com/gpu: .standup[i].parameters.resources.common.\"nvidia.com/gpu\"
+          memory: .standup[0].parameters.resources.common.memory
+          cpu: .standup[0].parameters.resources.common.cpu
+          nvidia.com/gpu: .standup[0].parameters.resources.common.\"nvidia.com/gpu\"
+          ephemeral-storage: .standup[0].parameters.resources.common.ephemeral-storage
         prefill:
-          memory: .standup[i].parameters.resources.common.memory
-          cpu: .standup[i].parameters.resources.common.cpu
-          nvidia.com/gpu: .standup[i].parameters.resources.common.\"nvidia.com/gpu\"
+          memory: .standup[0].parameters.resources.common.memory
+          cpu: .standup[0].parameters.resources.common.cpu
+          nvidia.com/gpu: .standup[0].parameters.resources.common.\"nvidia.com/gpu\"
+          ephemeral-storage: .standup[0].parameters.resources.common.ephemeral-storage
+      annotations:
+          deployed-by: ".auto" # just use current user name
+          modelservice: "llm-d-benchmark"
+      labels:
+          app: .standup[0].parameters.model[0].label
+          stood-up-by: ".auto" # just use current user name
+          stood-up-from: llm-d-benchmark
+          stood-up-via: "standalone"
       command:
-        common:
+        standalone:
+          - |
+            true ;
+            vllm serve .standup[0].parameters.model[0].name" \
+              --enable-sleep-mode \
+              --load-format auto \
+              --port .standup[0].parameters.ports.service \
+              --max-model-len .standup[0].parameters.model[0].maxlen \
+              --disable-log-requests \
+              --gpu-memory-utilization 0.95 \
+              --tensor-parallel-size .standup[0].parameters.parallelism.common.tensor \
+              --model-loader-extra-config "$LLMDBENCH_VLLM_STANDALONE_MODEL_LOADER_EXTRA_CONFIG"
+        decode:
           type: vllmServe
           args:
             - "--disable-log-requests"
             - "--max-model-len"
-            - "16384"
+            - ".standup[0].parameters.model[0].maxlen"
             - "--tensor-parallel-size"
-            - "1"
-        decode:
-          type: .standup[i].parameters.command.common.type
-          args: .standup[i].parameters.command.common.args
+            - ".standup[0].parameters.parallelism.decode.tensor"
         prefill:
-          type: .standup[i].parameters.command.common.type
-          args: .standup[i].parameters.command.common.args
+          type: vllmServe
+          args:
+            - "--disable-log-requests"
+            - "--max-model-len"
+            - ".standup[0].parameters.model[0].maxlen"
+            - "--tensor-parallel-size"
+            - ".standup[0].parameters.parallelism.prefill.tensor"
       env:
+        standalone:
+          - name: LLMDBENCH_VLLM_STANDALONE_MODEL
+            value: ".standup[0].parameters.model[0].name"
+          - name: LLMDBENCH_VLLM_STANDALONE_VLLM_LOAD_FORMAT
+            value: "auto"
+          - name: LLMDBENCH_VLLM_STANDALONE_MODEL_LOADER_EXTRA_CONFIG
+            value: "{}"
+          - name: VLLM_LOGGING_LEVEL
+            value: "INFO"
+          - name: HF_HOME
+            value: /.standup[0].stack.parameters.volumes[0].mount
+  #          - name: LLMDBENCH_VLLM_COMMON_AFFINITY
+  #            value: "nvidia.com/gpu.product:NVIDIA-H100-80GB-HBM3"
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: .prepare.dependencies.secrets[0].name
+                key: .prepare.dependencies.secrets[0].secret
+          - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+            value: "1"
+          - name: VLLM_SERVER_DEV_MODE
+            value: "1"
         common:
           - name: VLLM_NIXL_SIDE_CHANNEL_HOST
             valueFrom:
@@ -219,13 +281,13 @@ standup:
           ###- name: NCCL_IB_HCA
           ###  value: mlx5_1
           - name: VLLM_NIXL_SIDE_CHANNEL_PORT
-            value: ".standup[i].parameters.ports.nixl"
+            value: ".standup[0].parameters.ports.nixl"
           - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
             value: "1"
           - name: VLLM_SERVER_DEV_MODE
             value: "1"
-        decode: .standup[i].parameters.env.common
-        prefill: .standup[i].parameters.env.common
+        decode: .standup[0].parameters.env.common
+        prefill: .standup[0].parameters.env.common
       ports:
         service: 8000
         extra: 9002
@@ -255,15 +317,15 @@ standup:
               hub: .images[]|select(.name=="llm-d-inference-scheduler").registry/.images[]|select(.name=="llm-d-inference-scheduler").repo
               tag: .auto # automatically detects latest tag
               pullPolicy: Always
-            extProcPort: .standup[i].parameters.ports.extra
+            extProcPort: .standup[0].parameters.ports.extra
             extraContainerPorts:
               - name: zmq
-                containerPort: .standup[i].parameters.ports.zmq
+                containerPort: .standup[0].parameters.ports.zmq
                 protocol: TCP
             extraServicePorts:
               - name: zmq
-                port: .standup[i].parameters.ports.zmq
-                targetPort: .standup[i].parameters.ports.zmq
+                port: .standup[0].parameters.ports.zmq
+                targetPort: .standup[0].parameters.ports.zmq
                 protocol: TCP
             env:
               - name: .prepare.dependencies.secrets[0].secret
@@ -271,15 +333,15 @@ standup:
                   secretKeyRef:
                     name: .prepare.dependencies.secrets[0].name
                     key: .prepare.dependencies.secrets[0].secret
-            pluginsConfigFile: "default-plugins.yaml"
+            pluginsConfigFile: ".standup[0].parameters.gaie.plugins"
           inferencePool:
-            targetPortNumber: .standup[i].parameters.ports.service
+            targetPortNumber: .standup[0].parameters.ports.service
             modelServerType: vllm
             apiVersion: "inference.networking.x-k8s.io/v1alpha2"
             modelServers:
               matchLabels:
                 llm-d.ai/inferenceServing: "true"
-                llm-d.ai/model: .label(.standup[i].stack)
+                llm-d.ai/model: .standup[0].parameters.model[0].label
           provider:
             name: .auto # logic to decide the provider name based on deploy=true on .prepare.dependencies.gateway.provider
         deploy: true
@@ -288,15 +350,15 @@ standup:
     modelservice:
       - helm: .charts.llm-d-modelservice
         contents:
-          fullnameOverride: .label(.standup.stack[i])
+          fullnameOverride: .standup[0].parameters.model[0].label
           multinode: False
           modelArtifacts:
-            uri: .standup[i].stack.parameter.volumes[0].type://.standup[i].stack.parameter.volumes[0].mount/models/.standup[i].stack
-            size: .prepare.dependencies.storage[]|select(name=.standup[i].stack.parameter.volumes[0].name).size
+            uri: .standup[0].parameters.volumes[0].type://.standup[0].parameters.volumes[0].mount/models/.standup[0].parameters.model[0].name
+            size: .prepare.dependencies.storage[]|select(name=.standup[0].stack.parameters.volumes[0].name).size
             authSecretName: ".prepare.dependencies.secrets[0].name"
-            name: .standup[i].stack
+            name: .standup[0].parameters.model[0].name
           routing:
-            servicePort: .standup[i].parameters.ports.service
+            servicePort: .standup[0].parameters.ports.service
             parentRefs:
               - group: gateway.networking.k8s.io
                 kind: Gateway
@@ -308,15 +370,15 @@ standup:
               debugLevel: 3
             inferencePool:
               create: False
-              name: .label(.standup[i].stack)
+              name: .standup[0].parameters.model[0].label
             httpRoute:
               create: True
               rules:
               - backendRefs:
                 - group: inference.networking.x-k8s.io
                   kind: InferencePool
-                  name: .label(.standup[i].stack)
-                  port: .standup[i].parameters.ports.service
+                  name: .standup[0].parameters.model[0].label
+                  port: .standup[0].parameters.ports.service
                   weight: 1
                 timeouts:
                   backendRequest: 0s
@@ -324,7 +386,7 @@ standup:
                 matches:
                 - path:
                     type: PathPrefix
-                    value: /.standup[i].stack/
+                    value: /.standup[0].parameters.model[0].name/
                 filters:
                 - type: URLRewrite
                   urlRewrite:
@@ -334,8 +396,8 @@ standup:
               - backendRefs:
                 - group: inference.networking.x-k8s.io
                   kind: InferencePool
-                  name: .label(.standup[i].stack)
-                  port: .standup[i].parameters.ports.service
+                  name: .standup[0].parameters.model[0].label
+                  port: .standup[0].parameters.ports.service
                   weight: 1
                 timeouts:
                   backendRequest: 0s
@@ -343,105 +405,91 @@ standup:
             epp:
               create: False
           decode:
-            create: bool(.standup[i].parameters.replicas.decode)
-            replicas: .standup[i].parameters.replicas.decode
-            acceleratorTypes: .standup[i].parameters.accelerators.decode
+            create: bool(.standup[0].parameters.replicas.decode)
+            replicas: .standup[0].parameters.replicas.decode
+            acceleratorTypes:
+              labelKey: .standup[0].parameters.accelerators.decode.key
+              labelValues:
+                - .standup[0].parameters.accelerators.decode.value
             parallelism:
-              data: .standup[i].parameters.parallelism.decode.data
-              tensor: .standup[i].parameters.parallelism.decode.tensor
-            annotations:
-                deployed-by: ".auto" # just user current user name
-                modelservice: "llm-d-benchmark"
-            podAnnotations:
-                deployed-by: ".auto" # just use current user name
-                modelservice: "llm-d-benchmark"
+              data: .standup[0].parameters.parallelism.decode.data
+              tensor: .standup[0].parameters.parallelism.decode.tensor
+            annotations: .standup[0].parameters.annotations
+            podAnnotations: .standup[0].parameters.annotations
             extraConfig:
             containers:
             - name: "vllm"
               mountModelVolume: true
               image: ".images[]|select(.name==\"llm-d\").registry/.images[]|select(.name==\"llm-d\").repo/.images[]|select(.name==\"llm-d\").image:.images[]|select(.name==\"llm-d\").tag"
-              modelCommand: .standup[i].parameters.command.decode.type
-              args: .standup[i].parameters.command.decode.args
-              env: .standup[i].parameters.env.decode
+              modelCommand: .standup[0].parameters.command.decode.type
+              args: .standup[0].parameters.command.decode.args
+              env: .standup[0].parameters.env.decode
               resources:
-                limits:
-                  memory: .standup[i].parameters.resources.decode.memory
-                  cpu: ".standup[i].parameters.resources.decode.cpu"
-                  nvidia.com/gpu: ".standup[0].parameters.resources.decode.\"nvidia.com/gpu\""
-                requests:
-                  memory: .standup[i].parameters.resources.decode.memory
-                  cpu: ".standup[i].parameters.resources.decode.cpu"
-                  nvidia.com/gpu: ".standup[i].parameters.resources.decode.\"nvidia.com/gpu\""
+                limits: .standup[0].parameters.resources.decode
+                requests: .standup[0].parameters.resources.decode
               extraConfig:
                 startupProbe:
                   httpGet:
                     path: /health
-                    port: .standup[i].parameters.ports.service
+                    port: .standup[0].parameters.ports.service
                   failureThreshold: 60
                   initialDelaySeconds: 30
                   periodSeconds: 30
                   timeoutSeconds: 5
                 livenessProbe:
                   tcpSocket:
-                    port: .standup[i].parameters.ports.service
+                    port: .standup[0].parameters.ports.service
                   failureThreshold: 3
                   periodSeconds: 5
                 readinessProbe:
                   httpGet:
                     path: /health
-                    port: .standup[i].parameters.ports.readiness
+                    port: .standup[0].parameters.ports.readiness
                   failureThreshold: 3
                   periodSeconds: 5
               volumeMounts:
             volumes:
           prefill:
-            create: bool(.standup[i].parameters.replicas.prefill)
-            replicas: .standup[i].parameters.replicas.prefill]
-            acceleratorTypes: .standup[i].parameters.accelerators.decode
+            create: bool(.standup[0].parameters.replicas.prefill)
+            replicas: .standup[0].parameters.replicas.prefill]
+            acceleratorTypes:
+              labelKey: .standup[0].parameters.accelerators.prefill.key
+              labelValues:
+                - .standup[0].parameters.accelerators.common.value
             parallelism:
-              data: .standup[i].parameters.parallelism.prefill.data
-              tensor: .standup[i].parameters.parallelism.prefill.tensor
-            annotations:
-                deployed-by: ".auto" # just user current user name
-                modelservice: "llm-d-benchmark"
-            podAnnotations:
-                deployed-by: ".auto" # just use current user name
-                modelservice: "llm-d-benchmark"
+              data: .standup[0].parameters.parallelism.prefill.data
+              tensor: .standup[0].parameters.parallelism.prefill.tensor
+            annotations: .standup[0].parameters.annotations
+            podAnnotations: .standup[0].parameters.annotations
             extraConfig:
             containers:
             - name: "vllm"
               mountModelVolume: true
               image: ".images[]|select(.name==\"llm-d\").registry/.images[]|select(.name==\"llm-d\").repo/.images[]|select(.name==\"llm-d\").image:.images[]|select(.name==\"llm-d\").tag"
-              modelCommand: .standup[i].parameters.command.prefill.type
-              args: .standup[i].parameters.command.prefill.args
-              env: .standup[i].parameters.env.prefill
+              modelCommand: .standup[0].parameters.command.prefill.type
+              args: .standup[0].parameters.command.prefill.args
+              env: .standup[0].parameters.env.prefill
               resources:
-                limits:
-                  memory: .standup[i].parameters.resources.prefill.memory
-                  cpu: ".standup[i].parameters.resources.prefill.cpu"
-                  nvidia.com/gpu: ".standup[i].parameters.resources.prefill.\"nvidia.com/gpu\""
-                requests:
-                  memory: .standup[i].parameters.resources.prefill.memory
-                  cpu: ".standup[i].parameters.resources.prefill.cpu"
-                  nvidia.com/gpu: ".standup[i].parameters.resources.prefill.\"nvidia.com/gpu\""
+                limits: .standup[0].parameters.resources.prefill
+                requests: .standup[0].parameters.resources.prefill
               extraConfig:
                 startupProbe:
                   httpGet:
                     path: /health
-                    port: .standup[i].parameters.ports.service
+                    port: .standup[0].parameters.ports.service
                   failureThreshold: 60
                   initialDelaySeconds: 30
                   periodSeconds: 30
                   timeoutSeconds: 5
                 livenessProbe:
                   tcpSocket:
-                    port: .standup[i].parameters.ports.service
+                    port: .standup[0].parameters.ports.service
                   failureThreshold: 3
                   periodSeconds: 5
                 readinessProbe:
                   httpGet:
                     path: /health
-                    port: .standup[i].parameters.ports.service
+                    port: .standup[0].parameters.ports.service
                   failureThreshold: 3
                   periodSeconds: 5
               volumeMounts:
@@ -449,11 +497,112 @@ standup:
         deploy: true
         check: true
 # ----------------------------------------------------------------
+    standalone :
+      - type: deployment+service
+        contents:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: .standup[0].parameters.model[0].label
+            labels: .standup[0].parameters.labels
+            namespace: .standup[0].parameters.namespace
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: .standup[0].parameters.model[0].label
+            template:
+              metadata:
+                labels: .standup[0].parameters.labels
+                annotations: .standup[0].parameters.annotations
+              spec:
+                schedulerName: default-scheduler
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - key: .standup[0].parameters.accelerators.common.key
+                          operator: In
+                          values:
+                          - .standup[0].parameters.accelerators.common.value
+                containers:
+                - name: vllm-standalone-.standup[0].parameters.model[0].label
+                  image: ".images[]|select(.name==\"vllm\").registry/.images[]|select(.name==\"vllm\").repo/.images[]|select(.name==\"vllm\").image:.images[]|select(.name==\"vllm\").tag"
+                  imagePullPolicy: Always
+                  command:
+                  - /bin/bash
+                  - "-c"
+                  args: .standup[0].parameters.command.standalone
+                  env: .standup[0].parameters.env.standalone
+                  ports:
+                  - containerPort: .standup[0].parameters.ports.service
+                  startupProbe:
+                    httpGet:
+                      path: /health
+                      port: .standup[0].parameters.ports.service
+                    failureThreshold: 200
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                    timeoutSeconds: 5
+                  livenessProbe:
+                    tcpSocket:
+                      port: .standup[0].parameters.ports.service
+                    failureThreshold: 3
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: .standup[0].parameters.ports.service
+                    failureThreshold: 3
+                    periodSeconds: 5
+                  resources:
+                    limits: .standup[0].parameters.resources.prefill
+                    requests: .standup[0].parameters.resources.prefill
+                  volumeMounts:
+                  - name: preprocesses
+                    mountPath: /setup/preprocess
+                  - name: cache-volume
+                    mountPath: /.harness[0].parameters.volumes[0].mount
+                  - name: shm
+                    mountPath: /dev/shm
+                volumes:
+                - name: preprocesses
+                  configMap:
+                    name: .prepare.dependencies.files[0]
+                    defaultMode: 0500
+                - name: cache-volume
+                  persistentVolumeClaim:
+                    claimName: .harness[0].parameters.volumes[0].name
+          #          readOnly: true
+                - name: shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: .standup[0].parameters.model[0].name
+            namespace: .standup[0].parameters.namespace
+            labels: .standup[0].parameters.labels
+          spec:
+            ports:
+            - name: http
+              port: 80
+              targetPort: 8000
+            selector:
+              app: .standup[0].parameters.model[0].name
+            type: ClusterIP
+          deploy: true
+          check: true
+# --------------------------------------------------------------------------------------------------------------------------------
 harness:
-    - name: inference-perf
+    - runner: "runner-1"
       parameters:
         namespace: harnessns
-        profile: sanity_random.yaml
+        harness:
+          name: inference-perf
+          profile: sanity_random.yaml
         executable: llm-d-benchmark.sh
         timeout: 3600
         resources:
@@ -474,13 +623,13 @@ harness:
           - name: LLMDBENCH_RUN_WORKSPACE_DIR
             value: "/workspace"
           - name: LLMDBENCH_HARNESS_NAME
-            value: ".harness[i].parameters.name"
+            value: ".harness[0].parameters.harness.name"
 #          - name: LLMDBENCH_CONTROL_WORK_DIR
 #            value: "${LLMDBENCH_RUN_EXPERIMENT_RESULTS_DIR}"
           - name: LLMDBENCH_HARNESS_NAMESPACE
-            value: ".harness[i].parameters.namespace"
-          - name: LLMDBENCH_HARNESS_STACK_TYPE
-            value: "auto" # a function will determine if "modelservice" or "standlone" was set
+            value: ".harness[0].parameters.namespace"
+#          - name: LLMDBENCH_HARNESS_STACK_TYPE
+#            value: "auto" # a function will determine if "modelservice" or "standlone" was set
           - name: LLMDBENCH_HARNESS_STACK_ENDPOINT_URL
             value: "${LLMDBENCH_HARNESS_STACK_ENDPOINT_URL}"
           - name: LLMDBENCH_HARNESS_STACK_NAME
@@ -491,41 +640,52 @@ harness:
             value: "harness_pod"
           - name: HF_TOKEN_SECRET
             value: "${LLMDBENCH_VLLM_COMMON_HF_TOKEN_NAME}"
-          - name: HUGGING_FACE_HUB_TOKEN
+          - name: .prepare.dependencies.secrets[0].secret
             valueFrom:
               secretKeyRef:
-                name: ${LLMDBENCH_VLLM_COMMON_HF_TOKEN_NAME}
-                key: HF_TOKEN
+                name: .prepare.dependencies.secrets[0].name
+                key: .prepare.dependencies.secrets[0].secret
       contents:
         apiVersion: v1
         kind: Pod
         metadata:
-          name: .harness[i].parameters.name-launcher
-          namespace: .harness[i].parameters.namespace
+          name: .harness[0].parameters.harness.name-launcher
+          namespace: .harness[0].parameters.namespace
         labels:
-          app: .harness[i].parameters.name-launcher
-      spec:
-        containers:
-        - name: harness
-          image: ".images[]|select(.name==\"llm-d\").registry/.images[]|select(.name==\"llm-d\").repo/.images[]|select(.name==\"llm-d\").image:.images[]|select(.name==\"llm-d\").tag"
-          imagePullPolicy: Always
-          securityContext:
-            runAsUser: 0
-          command: ["sh", "-c"]
-          args:
-          - ".harness[i].parameters.executable"
-          resources:
-            limits:
-              cpu: ".harness[i].parameters.resources.cpu"
-              memory: .harness[i].parameters.resources.memory
-            requests:
-              cpu: ".harness[i].parameters.resources.cpu"
-              memory: .harness[i].parameters.resources.memory
-          env: .harness[i].parameters.env
-          volumeMounts:
-          - name: results
-            mountPath: .harness[i].parameters.volumes[0].mount
-        volumes:
-          - name: results
-            persistentVolumeClaim:
-              claimName: .harness[i].parameters.volumes[0].name
+          app: .harness[0].parameters.harness.name-launcher
+        spec:
+          containers:
+          - name: harness
+            image: ".images[]|select(.name==\"llm-d\").registry/.images[]|select(.name==\"llm-d\").repo/.images[]|select(.name==\"llm-d\").image:.images[]|select(.name==\"llm-d\").tag"
+            imagePullPolicy: Always
+            securityContext:
+              runAsUser: 0
+            command: ["sh", "-c"]
+            args:
+            - ".harness[0].parameters.executable"
+            resources:
+              limits:
+                cpu: ".harness[0].parameters.resources.cpu"
+                memory: .harness[0].parameters.resources.memory
+              requests:
+                cpu: ".harness[0].parameters.resources.cpu"
+                memory: .harness[0].parameters.resources.memory
+            env: .harness[0].parameters.env
+            volumeMounts:
+            - name: results
+              mountPath: .harness[0].parameters.volumes[0].mount
+            - name: replay
+              mountPath: .harness[0].parameters.volumes[1].mount
+          - mountPath: /workspace/profiles/.harness[0].parameters.harness.name
+            name: inference-perf-profiles
+          volumes:
+            - name: results
+              persistentVolumeClaim:
+                claimName: .harness[0].parameters.volumes[0].name
+            - name: results
+              persistentVolumeClaim:
+                claimName: .harness[0].parameters.volumes[1].name
+            - configMap:
+                defaultMode: 420
+                name: .harness[0].parameters.harness.name-profiles
+              name: .harness[0].parameters.harness.name-profiles
