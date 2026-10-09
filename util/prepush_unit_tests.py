@@ -9,6 +9,7 @@ back to the full suite. CI always runs everything.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -85,6 +86,12 @@ def resolve_python(root: Path) -> str:
     venv = root / ".venv" / "bin" / "python"
     if venv.is_file():
         return str(venv)
+    # The hook is launched with a bare `python`, which may predate the
+    # project's minimum (pyproject requires-python >= 3.14).
+    if sys.version_info < (3, 14):
+        newer = shutil.which("python3.14")
+        if newer:
+            return newer
     return sys.executable
 
 
