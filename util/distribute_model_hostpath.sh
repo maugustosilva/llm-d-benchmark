@@ -36,6 +36,9 @@
 #   -i, --image IMAGE         Image with hf, rsync and chcon (default: ghcr.io/llm-d/llm-d-benchmark:nightly)
 #   -c, --max-connections N   Concurrent rsync clients the seed serves (default: 4)
 #   -T, --timeout DURATION    Wait timeout for download and sync (default: 3600s)
+#   -o, --download-only       Only download on the seed node (to the PV first, with --pv):
+#                             the seed pod exits when done and the script checks that it
+#                             completed successfully. No rsync daemon, no sync DaemonSet.
 #   -k, --keep                Keep seed pod and DaemonSet after the sync finishes
 #   -d, --delete              Only delete the seed pod and DaemonSets, then exit
 #   -D, --dry-run             Run the (read-only) mount probe, then print the seed pod and
@@ -59,6 +62,7 @@ MAX_CONNECTIONS=4
 RSYNC_PORT=8873
 TIMEOUT=3600s
 KEEP=0
+DOWNLOAD_ONLY=0
 DELETE_ONLY=0
 DRY_RUN=0
 
@@ -77,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     -i|--image) IMAGE=$2; shift 2 ;;
     -c|--max-connections) MAX_CONNECTIONS=$2; shift 2 ;;
     -T|--timeout) TIMEOUT=$2; shift 2 ;;
+    -o|--download-only|--downloadonly) DOWNLOAD_ONLY=1; shift ;;
     -k|--keep) KEEP=1; shift ;;
     -d|--delete) DELETE_ONLY=1; shift ;;
     -D|--dry-run) DRY_RUN=1; shift ;;
@@ -355,6 +360,23 @@ EOF
   fi
 fi
 
+# With --download-only the seed pod runs to completion: it reports what it
+# has, then exits instead of serving over rsync.
+if [[ ${DOWNLOAD_ONLY} -eq 1 ]]; then
+  SEED_RESTART_POLICY=Never
+  SEED_DOWNLOAD_ONLY_EXIT='      echo "MODEL_STATS $(du -sh "${TARGET_DIR}" | cut -f1) $(find "${TARGET_DIR}" -type f ! -name .download-complete ! -path "*/.cache/*" | wc -l)"
+      exit 0
+'
+  if [[ ${DRY_RUN} -eq 0 ]]; then
+    # A finished seed pod from an earlier run would look like this run
+    # already succeeded (and its restartPolicy cannot be changed in place).
+    ${KCMD} delete pod "${SEED_POD}" --ignore-not-found --wait=true
+  fi
+else
+  SEED_RESTART_POLICY=Always
+  SEED_DOWNLOAD_ONLY_EXIT=""
+fi
+
 # --- Seed pod: download from HF, then serve over rsync daemon -------------
 cat <<EOF | apply_manifest
 apiVersion: v1
@@ -367,7 +389,7 @@ metadata:
     role: seed
 spec:
 ${SEED_PLACEMENT_YAML}
-  restartPolicy: Always
+  restartPolicy: ${SEED_RESTART_POLICY}
   serviceAccountName: ${SERVICE_ACCOUNT}
   # The container idles in 'sleep infinity', which ignores SIGTERM.
   terminationGracePeriodSeconds: 5
@@ -397,7 +419,7 @@ ${SEED_DOWNLOAD}
         touch "\${MARKER}"
         echo "Download complete."
       fi
-      cat > /tmp/rsyncd.conf <<CONF
+${SEED_DOWNLOAD_ONLY_EXIT}      cat > /tmp/rsyncd.conf <<CONF
       pid file = /tmp/rsyncd.pid
       lock file = /tmp/rsyncd.lock
       use chroot = no
@@ -447,6 +469,10 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
   # The seed pod does not exist, so there is no IP to sync from yet.
   SEED_IP="<seed-pod-ip>"
   SEED_NODE=${SEED_NODE:-<scheduled>}
+  if [[ ${DOWNLOAD_ONLY} -eq 1 ]]; then
+    echo "==> [dry-run] Nothing applied. Would download ${MODEL} on ${SEED_NODE} only (--download-only)"
+    exit 0
+  fi
 else
   if [[ -n "${PV_NAME}" ]]; then
     # Fail fast when no candidate node can attach the PV, instead of
@@ -458,6 +484,46 @@ else
     fi
     SEED_NODE=$(${KCMD} get pod "${SEED_POD}" -o 'jsonpath={.spec.nodeName}')
     echo "==> Seed pod scheduled on ${SEED_NODE}"
+  fi
+  if [[ ${DOWNLOAD_ONLY} -eq 1 ]]; then
+    # Poll the phase rather than 'kubectl wait', so a Failed pod is
+    # reported right away instead of after the whole timeout.
+    echo "==> Waiting for seed pod to download ${MODEL} and complete (timeout ${TIMEOUT})"
+    timeout_s=${TIMEOUT%s}
+    case "${timeout_s}" in
+      *h) timeout_s=$(( ${timeout_s%h} * 3600 )) ;;
+      *m) timeout_s=$(( ${timeout_s%m} * 60 )) ;;
+    esac
+    deadline=$(( SECONDS + timeout_s ))
+    phase=""
+    while (( SECONDS < deadline )); do
+      phase=$(${KCMD} get pod "${SEED_POD}" -o 'jsonpath={.status.phase}' 2>/dev/null || true)
+      [[ "${phase}" == "Succeeded" || "${phase}" == "Failed" ]] && break
+      sleep 10
+    done
+    SEED_NODE=$(${KCMD} get pod "${SEED_POD}" -o 'jsonpath={.spec.nodeName}' 2>/dev/null || echo "${SEED_NODE}")
+    stats=$(${KCMD} logs "${SEED_POD}" 2>/dev/null | sed -n 's/^MODEL_STATS //p' | tail -n 1 || true)
+    if [[ "${phase}" != "Succeeded" || -z "${stats}" || "${stats##* }" -le 0 ]]; then
+      echo "ERROR: seed pod did not complete successfully (phase: ${phase:-unknown}); last logs:" >&2
+      ${KCMD} logs "${SEED_POD}" --tail=50 >&2 || true
+      [[ ${KEEP} -eq 0 ]] && ${KCMD} delete pod "${SEED_POD}" --ignore-not-found --wait=true
+      exit 1
+    fi
+    echo
+    echo "==> Download summary: ${MODEL} at ${HOST_PATH}/${MODEL_PATH}"
+    printf '    %-28s %-8s %-6s %s\n' NODE SIZE FILES STATUS
+    printf '    %-28s %-8s %-6s %s\n' "${SEED_NODE}" "${stats%% *}" "${stats##* }" "downloaded (seed pod Succeeded)"
+    echo
+    if [[ ${KEEP} -eq 0 ]]; then
+      ${KCMD} delete pod "${SEED_POD}" --ignore-not-found --wait=true
+    else
+      echo "==> Keeping completed seed pod (--keep). Remove with: $0 -n ${NAMESPACE} --delete"
+    fi
+    if [[ -n "${PV_NAME}" ]]; then
+      echo "==> Keeping PVC ${PVC_NAME} (model cached on PV ${PV_NAME}). Remove with: kubectl -n ${NAMESPACE} delete pvc ${PVC_NAME}"
+    fi
+    echo "==> SUCCESS: ${MODEL} is downloaded on seed node ${SEED_NODE} (--download-only, not synced to other nodes)"
+    exit 0
   fi
   echo "==> Waiting for seed pod to download ${MODEL} (timeout ${TIMEOUT})"
   if ! ${KCMD} wait --for=condition=Ready "pod/${SEED_POD}" --timeout="${TIMEOUT}"; then
