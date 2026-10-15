@@ -11,6 +11,11 @@
 # Layout on every node: <host-path>/models/<HF_MODEL_ID>/ plus a
 # .download-complete marker (same layout the standup hostPath download uses).
 #
+# With --pv, the seed pod first downloads into a PVC bound to that PV (same
+# models/<HF_MODEL_ID>/ layout and marker), then copies it to the seed node's
+# hostPath. The PVC is kept after the run, so the PV acts as a persistent
+# cache: a later run that finds the model on it skips the HF download.
+#
 # Usage:
 #   util/distribute_model_hostpath.sh -m <hf-model-id> [options]
 #
@@ -20,6 +25,11 @@
 #   -s, --seed-node NODE      Node that downloads from HF (default: first node with the mount)
 #   -p, --host-path DIR       hostPath mount point on the nodes (default: /var/model-cache)
 #   -l, --node-selector K=V   Only consider nodes with this label (repeatable)
+#   -v, --pv NAME             Download to a PVC bound to this (Filesystem) PV first, then
+#                             copy to the hostPath. The PVC (model-seed-<NAME>) is created
+#                             if missing and never deleted by this script. If the PV has
+#                             node affinity and --seed-node is not set, the scheduler picks
+#                             the seed among the mounted nodes the PV can attach to.
 #   -t, --hf-secret NAME      Secret holding key HF_TOKEN (default: llm-d-hf-token).
 #                             Created from $HF_TOKEN if it does not exist.
 #   -a, --service-account SA  Service account for the pods (default: default)
@@ -41,6 +51,7 @@ NAMESPACE=${NAMESPACE:-default}
 SEED_NODE=""
 HOST_PATH=/var/model-cache
 NODE_SELECTORS=()
+PV_NAME=""
 HF_SECRET=llm-d-hf-token #pragma: allowlist secret
 SERVICE_ACCOUNT=default
 IMAGE=ghcr.io/llm-d/llm-d-benchmark:nightly
@@ -60,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     -s|--seed-node) SEED_NODE=$2; shift 2 ;;
     -p|--host-path) HOST_PATH=$2; shift 2 ;;
     -l|--node-selector) NODE_SELECTORS+=("$2"); shift 2 ;;
+    -v|--pv) PV_NAME=$2; shift 2 ;;
     -t|--hf-secret) HF_SECRET=$2; shift 2 ;;
     -a|--service-account) SERVICE_ACCOUNT=$2; shift 2 ;;
     -i|--image) IMAGE=$2; shift 2 ;;
@@ -78,6 +90,7 @@ SEED_POD=model-seed
 DS_NAME=model-sync-ds
 PROBE_DS_NAME=model-mount-probe
 LABEL_SELECTOR="app=llm-d-benchmark-harness,component=model-distribute"
+PVC_NAME=${PV_NAME:+model-seed-${PV_NAME}}
 
 cleanup() {
   echo "==> Deleting seed pod ${SEED_POD} and DaemonSets ${DS_NAME}, ${PROBE_DS_NAME} in ${NAMESPACE}"
@@ -111,6 +124,31 @@ if [[ -z "${MODEL}" ]]; then
   usage 1
 fi
 MODEL_PATH="models/${MODEL}"
+
+# --- PV: validate before touching the nodes --------------------------------
+if [[ -n "${PV_NAME}" ]]; then
+  PV_INFO=$(kubectl get pv "${PV_NAME}" -o 'jsonpath={.status.phase}|{.spec.claimRef.namespace}|{.spec.claimRef.name}|{.spec.volumeMode}|{.spec.storageClassName}|{.spec.capacity.storage}|{.spec.accessModes}' 2>/dev/null) || {
+    echo "ERROR: PV ${PV_NAME} not found" >&2
+    exit 1
+  }
+  IFS='|' read -r PV_PHASE PV_CLAIM_NS PV_CLAIM_NAME PV_VOLUME_MODE PV_STORAGE_CLASS PV_CAPACITY PV_ACCESS_MODES <<< "${PV_INFO}"
+  if [[ "${PV_VOLUME_MODE:-Filesystem}" != "Filesystem" ]]; then
+    echo "ERROR: PV ${PV_NAME} has volumeMode ${PV_VOLUME_MODE}; only Filesystem is supported" >&2
+    exit 1
+  fi
+  if [[ -n "${PV_CLAIM_NAME}" && "${PV_CLAIM_NS}/${PV_CLAIM_NAME}" != "${NAMESPACE}/${PVC_NAME}" ]]; then
+    echo "ERROR: PV ${PV_NAME} (${PV_PHASE}) is claimed by ${PV_CLAIM_NS}/${PV_CLAIM_NAME}, not ${NAMESPACE}/${PVC_NAME}" >&2
+    if [[ "${PV_PHASE}" == "Released" ]]; then
+      echo "       If that claim is gone and the data may be reused, free the PV with:" >&2
+      echo "       kubectl patch pv ${PV_NAME} --type json -p '[{\"op\":\"remove\",\"path\":\"/spec/claimRef\"}]'" >&2
+    fi
+    exit 1
+  fi
+  if [[ "${PV_PHASE}" == "Released" || "${PV_PHASE}" == "Failed" ]]; then
+    echo "ERROR: PV ${PV_NAME} is ${PV_PHASE}; it cannot be bound until its claimRef is cleared" >&2
+    exit 1
+  fi
+fi
 
 # --- HF token secret -------------------------------------------------------
 if ! ${KCMD} get secret "${HF_SECRET}" >/dev/null 2>&1; then
@@ -210,22 +248,112 @@ fi
 echo "==> Nodes with ${HOST_PATH} mounted (${#MOUNTED_NODES[@]}): ${MOUNTED_NODES[*]}"
 
 # --- Seed node -------------------------------------------------------------
-if [[ -z "${SEED_NODE}" ]]; then
-  SEED_NODE=${MOUNTED_NODES[0]}
-elif [[ " ${MOUNTED_NODES[*]} " != *" ${SEED_NODE} "* ]]; then
+if [[ -n "${SEED_NODE}" && " ${MOUNTED_NODES[*]} " != *" ${SEED_NODE} "* ]]; then
   echo "ERROR: seed node ${SEED_NODE} does not have a mount at ${HOST_PATH}" >&2
   exit 1
 fi
 
+# Without a PV, pin the seed with nodeName. With a PV, let the scheduler
+# place it among the candidates so the PV's own node affinity (e.g. a local
+# PV) is honoured; nodeName would bypass that check.
+if [[ -z "${PV_NAME}" ]]; then
+  SEED_NODE=${SEED_NODE:-${MOUNTED_NODES[0]}}
+  SEED_PLACEMENT_YAML="  nodeName: ${SEED_NODE}"
+else
+  if [[ -n "${SEED_NODE}" ]]; then
+    SEED_CANDIDATES=("${SEED_NODE}")
+  else
+    SEED_CANDIDATES=("${MOUNTED_NODES[@]}")
+  fi
+  SEED_PLACEMENT_YAML="  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:"
+  for node in "${SEED_CANDIDATES[@]}"; do
+    SEED_PLACEMENT_YAML+="
+        - matchFields:
+          - key: metadata.name
+            operator: In
+            values: [\"${node}\"]"
+  done
+fi
+
 echo "==> Model:      ${MODEL}"
 echo "==> Namespace:  ${NAMESPACE}"
-echo "==> Seed node:  ${SEED_NODE}"
+echo "==> Seed node:  ${SEED_NODE:-<scheduler picks a mounted node the PV can attach to>}"
 echo "==> Host path:  ${HOST_PATH}/${MODEL_PATH}"
+if [[ -n "${PV_NAME}" ]]; then
+  echo "==> PV:         ${PV_NAME} (${PV_CAPACITY}) via PVC ${PVC_NAME}"
+fi
 
 # Serving pods mount the node directory directly, so on SELinux nodes the
 # files need a label non-spc_t containers can read. Non-SELinux nodes reject
 # chcon; that is not an error there.
 RELABEL='chcon -R -t container_file_t /var/model-cache || echo "chcon failed (SELinux not enabled?); continuing."'
+
+# --- Seed download step ----------------------------------------------------
+# Spliced into the seed pod script's download branch below (8-space indent;
+# the heredoc does not re-expand the ${...} inside it).
+if [[ -z "${PV_NAME}" ]]; then
+  SEED_DOWNLOAD='        echo "Downloading model to ${TARGET_DIR}..."
+        mkdir -p "${TARGET_DIR}"
+        hf download "${HF_MODEL_ID}" --local-dir "${TARGET_DIR}"'
+  SEED_PVC_MOUNT_YAML=""
+  SEED_PVC_VOLUME_YAML=""
+else
+  # Download to the PVC (skipped when an earlier run left the model there),
+  # then copy to the hostPath. --inplace avoids a 2x temp copy of shards.
+  SEED_DOWNLOAD='        PVC_DIR="/var/model-pvc/${MODEL_PATH}"
+        if [ -f "${PVC_DIR}/.download-complete" ]; then
+          echo "Model already present on PVC at ${PVC_DIR}, skipping HF download."
+        else
+          echo "Downloading model to PVC at ${PVC_DIR}..."
+          mkdir -p "${PVC_DIR}"
+          hf download "${HF_MODEL_ID}" --local-dir "${PVC_DIR}"
+          touch "${PVC_DIR}/.download-complete"
+        fi
+        echo "Copying model from PVC to ${TARGET_DIR}..."
+        mkdir -p "${TARGET_DIR}"
+        rsync -a --inplace --exclude=.download-complete "${PVC_DIR}/" "${TARGET_DIR}/"'
+  SEED_PVC_MOUNT_YAML="
+    - name: model-pvc-storage
+      mountPath: /var/model-pvc"
+  SEED_PVC_VOLUME_YAML="
+  - name: model-pvc-storage
+    persistentVolumeClaim:
+      claimName: ${PVC_NAME}"
+
+  # --- PVC pre-bound to the PV (reused across runs) ------------------------
+  if ${KCMD} get pvc "${PVC_NAME}" >/dev/null 2>&1; then
+    echo "==> Reusing PVC ${PVC_NAME}"
+  else
+    echo "==> Creating PVC ${PVC_NAME} bound to PV ${PV_NAME}"
+    # An empty storageClassName must be explicit, or the default class
+    # would be injected and the PVC would never match the PV.
+    cat <<EOF | apply_manifest
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${PVC_NAME}
+  labels:
+    app: llm-d-benchmark-harness
+    component: model-distribute
+spec:
+  volumeName: ${PV_NAME}
+  storageClassName: "${PV_STORAGE_CLASS}"
+  accessModes: ${PV_ACCESS_MODES}
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: ${PV_CAPACITY}
+EOF
+  fi
+  if [[ ${DRY_RUN} -eq 0 ]] && ! ${KCMD} wait --for=jsonpath='{.status.phase}'=Bound "pvc/${PVC_NAME}" --timeout=120s; then
+    echo "ERROR: PVC ${PVC_NAME} did not bind to PV ${PV_NAME}:" >&2
+    ${KCMD} describe pvc "${PVC_NAME}" | tail -n 15 >&2 || true
+    exit 1
+  fi
+fi
 
 # --- Seed pod: download from HF, then serve over rsync daemon -------------
 cat <<EOF | apply_manifest
@@ -238,7 +366,7 @@ metadata:
     component: model-distribute
     role: seed
 spec:
-  nodeName: ${SEED_NODE}
+${SEED_PLACEMENT_YAML}
   restartPolicy: Always
   serviceAccountName: ${SERVICE_ACCOUNT}
   # The container idles in 'sleep infinity', which ignores SIGTERM.
@@ -263,9 +391,7 @@ spec:
       if [ -f "\${MARKER}" ]; then
         echo "Model already present at \${TARGET_DIR}, skipping download."
       else
-        echo "Downloading model to \${TARGET_DIR}..."
-        mkdir -p "\${TARGET_DIR}"
-        hf download "\${HF_MODEL_ID}" --local-dir "\${TARGET_DIR}"
+${SEED_DOWNLOAD}
         echo "Relabelling for non-spc_t readers..."
         ${RELABEL}
         touch "\${MARKER}"
@@ -309,18 +435,30 @@ spec:
       periodSeconds: 10
     volumeMounts:
     - name: model-host-storage
-      mountPath: /var/model-cache
+      mountPath: /var/model-cache${SEED_PVC_MOUNT_YAML}
   volumes:
   - name: model-host-storage
     hostPath:
       path: ${HOST_PATH}
-      type: Directory
+      type: Directory${SEED_PVC_VOLUME_YAML}
 EOF
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
   # The seed pod does not exist, so there is no IP to sync from yet.
   SEED_IP="<seed-pod-ip>"
+  SEED_NODE=${SEED_NODE:-<scheduled>}
 else
+  if [[ -n "${PV_NAME}" ]]; then
+    # Fail fast when no candidate node can attach the PV, instead of
+    # sitting Pending for the whole download timeout.
+    if ! ${KCMD} wait --for=condition=PodScheduled "pod/${SEED_POD}" --timeout=120s; then
+      echo "ERROR: seed pod could not be scheduled on a mounted node the PV ${PV_NAME} can attach to:" >&2
+      ${KCMD} get events --field-selector "involvedObject.name=${SEED_POD}" --sort-by=.lastTimestamp | tail -n 5 >&2 || true
+      exit 1
+    fi
+    SEED_NODE=$(${KCMD} get pod "${SEED_POD}" -o 'jsonpath={.spec.nodeName}')
+    echo "==> Seed pod scheduled on ${SEED_NODE}"
+  fi
   echo "==> Waiting for seed pod to download ${MODEL} (timeout ${TIMEOUT})"
   if ! ${KCMD} wait --for=condition=Ready "pod/${SEED_POD}" --timeout="${TIMEOUT}"; then
     echo "ERROR: seed pod did not become Ready; last logs:" >&2
@@ -515,6 +653,9 @@ if [[ ${KEEP} -eq 0 ]]; then
   cleanup
 else
   echo "==> Keeping seed pod and DaemonSet (--keep). Remove with: $0 -n ${NAMESPACE} --delete"
+fi
+if [[ -n "${PV_NAME}" ]]; then
+  echo "==> Keeping PVC ${PVC_NAME} (model cached on PV ${PV_NAME}). Remove with: kubectl -n ${NAMESPACE} delete pvc ${PVC_NAME}"
 fi
 
 if [[ ${FAILED} -gt 0 ]]; then
