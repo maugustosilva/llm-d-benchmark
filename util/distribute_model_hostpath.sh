@@ -30,6 +30,9 @@
 #                             if missing and never deleted by this script. If the PV has
 #                             node affinity and --seed-node is not set, the scheduler picks
 #                             the seed among the mounted nodes the PV can attach to.
+#                             If the PV is ReadWriteMany and its CSI volumeHandle contains
+#                             a /mnt path, that path is printed (on stdout) and the script
+#                             exits without downloading anything.
 #   -t, --hf-secret NAME      Secret holding key HF_TOKEN (default: llm-d-hf-token).
 #                             Created from $HF_TOKEN if it does not exist.
 #   -a, --service-account SA  Service account for the pods (default: default)
@@ -132,11 +135,19 @@ MODEL_PATH="models/${MODEL}"
 
 # --- PV: validate before touching the nodes --------------------------------
 if [[ -n "${PV_NAME}" ]]; then
-  PV_INFO=$(kubectl get pv "${PV_NAME}" -o 'jsonpath={.status.phase}|{.spec.claimRef.namespace}|{.spec.claimRef.name}|{.spec.volumeMode}|{.spec.storageClassName}|{.spec.capacity.storage}|{.spec.accessModes}' 2>/dev/null) || {
+  PV_INFO=$(kubectl get pv "${PV_NAME}" -o 'jsonpath={.status.phase}|{.spec.claimRef.namespace}|{.spec.claimRef.name}|{.spec.volumeMode}|{.spec.storageClassName}|{.spec.capacity.storage}|{.spec.accessModes}|{.spec.csi.volumeHandle}' 2>/dev/null) || {
     echo "ERROR: PV ${PV_NAME} not found" >&2
     exit 1
   }
-  IFS='|' read -r PV_PHASE PV_CLAIM_NS PV_CLAIM_NAME PV_VOLUME_MODE PV_STORAGE_CLASS PV_CAPACITY PV_ACCESS_MODES <<< "${PV_INFO}"
+  IFS='|' read -r PV_PHASE PV_CLAIM_NS PV_CLAIM_NAME PV_VOLUME_MODE PV_STORAGE_CLASS PV_CAPACITY PV_ACCESS_MODES PV_VOLUME_HANDLE <<< "${PV_INFO}"
+  # A ReadWriteMany PV whose CSI volumeHandle names a /mnt path is a shared
+  # filesystem already present on the nodes: report that path and stop.
+  PV_MNT_PATH=$(grep -o '/mnt[^;,#|[:space:]]*' <<< "${PV_VOLUME_HANDLE}" | head -n 1 || true)
+  if [[ "${PV_ACCESS_MODES}" == *'"ReadWriteMany"'* && -n "${PV_MNT_PATH}" ]]; then
+    echo "==> PV ${PV_NAME} is ReadWriteMany with volumeHandle ${PV_VOLUME_HANDLE}; path:" >&2
+    echo "${PV_MNT_PATH}"
+    exit 0
+  fi
   if [[ "${PV_VOLUME_MODE:-Filesystem}" != "Filesystem" ]]; then
     echo "ERROR: PV ${PV_NAME} has volumeMode ${PV_VOLUME_MODE}; only Filesystem is supported" >&2
     exit 1
